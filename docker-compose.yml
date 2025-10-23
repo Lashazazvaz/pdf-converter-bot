@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  pdf-converter-bot:
+    build: .
+    container_name: pdf-converter-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - MAX_FILE_SIZE=20971520
+      - TEMP_DIR=/app/temp_files
+    volumes:
+      - ./temp_files:/app/temp_files
+    env_file:
+      - .env
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge

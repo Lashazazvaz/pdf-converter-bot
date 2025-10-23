@@ -1,0 +1,8 @@
+# Токен вашего Telegram бота (получите у @BotFather)
+BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+
+# Максимальный размер файла в байтах (по умолчанию 20MB)
+MAX_FILE_SIZE=20971520
+
+# Папка для временных файлов
+TEMP_DIR=temp_files
