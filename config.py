@@ -30,3 +30,11 @@ CONVERSION_SETTINGS = {
         'preserve_formatting': True
     }
 }
+
+# Настройки таймаутов (в секундах)
+TIMEOUT_SETTINGS = {
+    'file_download': 300,  # 5 минут для скачивания файла
+    'file_upload': 300,    # 5 минут для загрузки файла
+    'conversion': 600,     # 10 минут для конвертации
+    'telegram_request': 30 # 30 секунд для запросов к Telegram API
+}

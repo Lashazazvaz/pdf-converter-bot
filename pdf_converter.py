@@ -1,6 +1,7 @@
 import os
 import tempfile
 import logging
+import asyncio
 from pathlib import Path
 from typing import Optional, Tuple
 import fitz  # PyMuPDF
@@ -19,6 +20,20 @@ class PDFConverter:
     def __init__(self, temp_dir: str = 'temp_files'):
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(exist_ok=True)
+    
+    async def _run_with_timeout(self, func, *args, timeout: int = 600, **kwargs):
+        """Выполняет функцию с таймаутом"""
+        try:
+            return await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, func, *args, **kwargs),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут при выполнении операции {func.__name__}")
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка при выполнении операции {func.__name__}: {e}")
+            return False
     
     def validate_pdf(self, file_path: str) -> bool:
         """Проверяет, является ли файл валидным PDF"""

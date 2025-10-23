@@ -9,8 +9,9 @@ from telegram.ext import (
     ContextTypes, filters
 )
 from telegram.constants import ParseMode
+from telegram.error import TimedOut, NetworkError
 
-from config import BOT_TOKEN, MAX_FILE_SIZE, TEMP_DIR, SUPPORTED_FORMATS
+from config import BOT_TOKEN, MAX_FILE_SIZE, TEMP_DIR, SUPPORTED_FORMATS, TIMEOUT_SETTINGS
 from pdf_converter import PDFConverter
 
 # Настройка логирования
@@ -27,6 +28,60 @@ class PDFBot:
         self.converter = PDFConverter(TEMP_DIR)
         self.temp_dir = Path(TEMP_DIR)
         self.temp_dir.mkdir(exist_ok=True)
+    
+    async def _download_file_with_timeout(self, bot, file_id: str, file_path: Path) -> bool:
+        """Скачивает файл с таймаутом"""
+        try:
+            # Получаем информацию о файле с таймаутом
+            file = await asyncio.wait_for(
+                bot.get_file(file_id),
+                timeout=TIMEOUT_SETTINGS['telegram_request']
+            )
+            
+            # Скачиваем файл с таймаутом
+            await asyncio.wait_for(
+                file.download_to_drive(file_path),
+                timeout=TIMEOUT_SETTINGS['file_download']
+            )
+            
+            return True
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут при скачивании файла {file_id}")
+            return False
+        except (TimedOut, NetworkError) as e:
+            logger.error(f"Ошибка сети при скачивании файла: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при скачивании файла: {e}")
+            return False
+    
+    async def _send_file_with_timeout(self, bot, chat_id: int, file_path: Path, 
+                                    filename: str, caption: str) -> bool:
+        """Отправляет файл с таймаутом"""
+        try:
+            with open(file_path, 'rb') as file:
+                await asyncio.wait_for(
+                    bot.send_document(
+                        chat_id=chat_id,
+                        document=file,
+                        filename=filename,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML
+                    ),
+                    timeout=TIMEOUT_SETTINGS['file_upload']
+                )
+            return True
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут при отправке файла {filename}")
+            return False
+        except (TimedOut, NetworkError) as e:
+            logger.error(f"Ошибка сети при отправке файла: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при отправке файла: {e}")
+            return False
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
@@ -203,11 +258,22 @@ class PDFBot:
         await query.edit_message_text("⏳ Обрабатываю файл... Пожалуйста, подождите.")
         
         try:
-            # Скачиваем файл
-            file = await context.bot.get_file(file_info['file_id'])
+            # Скачиваем файл с таймаутом
             pdf_path = self.temp_dir / file_info['file_name']
             
-            await file.download_to_drive(pdf_path)
+            download_success = await self._download_file_with_timeout(
+                context.bot, 
+                file_info['file_id'], 
+                pdf_path
+            )
+            
+            if not download_success:
+                await query.edit_message_text(
+                    "❌ Ошибка при скачивании файла!\n"
+                    "Возможно, файл слишком большой или произошла ошибка сети.\n"
+                    "Попробуйте еще раз."
+                )
+                return
             
             # Валидируем PDF
             if not self.converter.validate_pdf(str(pdf_path)):
@@ -215,13 +281,13 @@ class PDFBot:
                 self.converter.cleanup_temp_files(str(pdf_path))
                 return
             
-            # Выполняем конвертацию в зависимости от выбора
+            # Выполняем конвертацию в зависимости от выбора с таймаутом
             if query.data == "convert_word":
-                await self._convert_to_word(update, context, pdf_path, file_info)
+                await self._convert_to_word_async(update, context, pdf_path, file_info)
             elif query.data == "convert_excel":
-                await self._convert_to_excel(update, context, pdf_path, file_info)
+                await self._convert_to_excel_async(update, context, pdf_path, file_info)
             elif query.data == "convert_text":
-                await self._extract_text_only(update, context, pdf_path, file_info)
+                await self._extract_text_only_async(update, context, pdf_path, file_info)
             
         except Exception as e:
             logger.error(f"Ошибка обработки файла: {e}")
@@ -234,6 +300,63 @@ class PDFBot:
             if 'pdf_path' in locals():
                 self.converter.cleanup_temp_files(str(pdf_path))
             context.user_data.pop('current_file', None)
+    
+    async def _convert_to_word_async(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                    pdf_path: Path, file_info: dict):
+        """Конвертирует PDF в Word с таймаутом"""
+        query = update.callback_query
+        
+        # Создаем имя выходного файла
+        output_name = file_info['file_name'].replace('.pdf', '.docx')
+        output_path = self.temp_dir / output_name
+        
+        try:
+            # Выполняем конвертацию с таймаутом
+            success = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.converter.convert_to_word,
+                    str(pdf_path),
+                    str(output_path),
+                    True,  # preserve_layout
+                    True   # include_images
+                ),
+                timeout=TIMEOUT_SETTINGS['conversion']
+            )
+            
+            if success and output_path.exists():
+                # Отправляем результат с таймаутом
+                send_success = await self._send_file_with_timeout(
+                    context.bot,
+                    query.message.chat_id,
+                    output_path,
+                    output_name,
+                    f"✅ <b>Конвертация завершена!</b>\n"
+                    f"📄 {file_info['file_name']} → {output_name}"
+                )
+                
+                if send_success:
+                    await query.edit_message_text("✅ Файл успешно конвертирован в Word!")
+                else:
+                    await query.edit_message_text(
+                        "❌ Ошибка при отправке файла!\n"
+                        "Конвертация прошла успешно, но не удалось отправить результат."
+                    )
+                
+                self.converter.cleanup_temp_files(str(output_path))
+            else:
+                await query.edit_message_text("❌ Ошибка конвертации в Word!")
+                
+        except asyncio.TimeoutError:
+            await query.edit_message_text(
+                "⏰ <b>Превышено время конвертации!</b>\n\n"
+                "Файл слишком большой или сложный для обработки.\n"
+                "Попробуйте отправить файл меньшего размера."
+            )
+            logger.error(f"Таймаут конвертации Word для файла {file_info['file_name']}")
+        except Exception as e:
+            await query.edit_message_text("❌ Ошибка конвертации в Word!")
+            logger.error(f"Ошибка конвертации Word: {e}")
     
     async def _convert_to_word(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
                               pdf_path: Path, file_info: dict):
@@ -253,21 +376,82 @@ class PDFBot:
         )
         
         if success and output_path.exists():
-            # Отправляем результат
-            with open(output_path, 'rb') as docx_file:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=docx_file,
-                    filename=output_name,
-                    caption=f"✅ <b>Конвертация завершена!</b>\n"
-                           f"📄 {file_info['file_name']} → {output_name}",
-                    parse_mode=ParseMode.HTML
+            # Отправляем результат с таймаутом
+            send_success = await self._send_file_with_timeout(
+                context.bot,
+                query.message.chat_id,
+                output_path,
+                output_name,
+                f"✅ <b>Конвертация завершена!</b>\n"
+                f"📄 {file_info['file_name']} → {output_name}"
+            )
+            
+            if send_success:
+                await query.edit_message_text("✅ Файл успешно конвертирован в Word!")
+            else:
+                await query.edit_message_text(
+                    "❌ Ошибка при отправке файла!\n"
+                    "Конвертация прошла успешно, но не удалось отправить результат."
                 )
             
-            await query.edit_message_text("✅ Файл успешно конвертирован в Word!")
             self.converter.cleanup_temp_files(str(output_path))
         else:
             await query.edit_message_text("❌ Ошибка конвертации в Word!")
+    
+    async def _convert_to_excel_async(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                     pdf_path: Path, file_info: dict):
+        """Конвертирует PDF в Excel с таймаутом"""
+        query = update.callback_query
+        
+        # Создаем имя выходного файла
+        output_name = file_info['file_name'].replace('.pdf', '.xlsx')
+        output_path = self.temp_dir / output_name
+        
+        try:
+            # Выполняем конвертацию с таймаутом
+            success = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.converter.extract_tables_to_excel,
+                    str(pdf_path),
+                    str(output_path)
+                ),
+                timeout=TIMEOUT_SETTINGS['conversion']
+            )
+            
+            if success and output_path.exists():
+                # Отправляем результат с таймаутом
+                send_success = await self._send_file_with_timeout(
+                    context.bot,
+                    query.message.chat_id,
+                    output_path,
+                    output_name,
+                    f"✅ <b>Конвертация завершена!</b>\n"
+                    f"📊 {file_info['file_name']} → {output_name}"
+                )
+                
+                if send_success:
+                    await query.edit_message_text("✅ Файл успешно конвертирован в Excel!")
+                else:
+                    await query.edit_message_text(
+                        "❌ Ошибка при отправке файла!\n"
+                        "Конвертация прошла успешно, но не удалось отправить результат."
+                    )
+                
+                self.converter.cleanup_temp_files(str(output_path))
+            else:
+                await query.edit_message_text("❌ Ошибка конвертации в Excel!")
+                
+        except asyncio.TimeoutError:
+            await query.edit_message_text(
+                "⏰ <b>Превышено время конвертации!</b>\n\n"
+                "Файл слишком большой или сложный для обработки.\n"
+                "Попробуйте отправить файл меньшего размера."
+            )
+            logger.error(f"Таймаут конвертации Excel для файла {file_info['file_name']}")
+        except Exception as e:
+            await query.edit_message_text("❌ Ошибка конвертации в Excel!")
+            logger.error(f"Ошибка конвертации Excel: {e}")
     
     async def _convert_to_excel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                pdf_path: Path, file_info: dict):
@@ -282,21 +466,84 @@ class PDFBot:
         success = self.converter.extract_tables_to_excel(str(pdf_path), str(output_path))
         
         if success and output_path.exists():
-            # Отправляем результат
-            with open(output_path, 'rb') as excel_file:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=excel_file,
-                    filename=output_name,
-                    caption=f"✅ <b>Конвертация завершена!</b>\n"
-                           f"📊 {file_info['file_name']} → {output_name}",
-                    parse_mode=ParseMode.HTML
+            # Отправляем результат с таймаутом
+            send_success = await self._send_file_with_timeout(
+                context.bot,
+                query.message.chat_id,
+                output_path,
+                output_name,
+                f"✅ <b>Конвертация завершена!</b>\n"
+                f"📊 {file_info['file_name']} → {output_name}"
+            )
+            
+            if send_success:
+                await query.edit_message_text("✅ Файл успешно конвертирован в Excel!")
+            else:
+                await query.edit_message_text(
+                    "❌ Ошибка при отправке файла!\n"
+                    "Конвертация прошла успешно, но не удалось отправить результат."
                 )
             
-            await query.edit_message_text("✅ Файл успешно конвертирован в Excel!")
             self.converter.cleanup_temp_files(str(output_path))
         else:
             await query.edit_message_text("❌ Ошибка конвертации в Excel!")
+    
+    async def _extract_text_only_async(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                      pdf_path: Path, file_info: dict):
+        """Извлекает только текст из PDF с таймаутом"""
+        query = update.callback_query
+        
+        try:
+            # Извлекаем текст с таймаутом
+            text = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.converter.extract_text_only,
+                    str(pdf_path)
+                ),
+                timeout=TIMEOUT_SETTINGS['conversion']
+            )
+            
+            if text:
+                # Создаем текстовый файл
+                output_name = file_info['file_name'].replace('.pdf', '.txt')
+                output_path = self.temp_dir / output_name
+                
+                with open(output_path, 'w', encoding='utf-8') as txt_file:
+                    txt_file.write(text)
+                
+                # Отправляем результат с таймаутом
+                send_success = await self._send_file_with_timeout(
+                    context.bot,
+                    query.message.chat_id,
+                    output_path,
+                    output_name,
+                    f"✅ <b>Текст извлечен!</b>\n"
+                    f"📝 {file_info['file_name']} → {output_name}"
+                )
+                
+                if send_success:
+                    await query.edit_message_text("✅ Текст успешно извлечен!")
+                else:
+                    await query.edit_message_text(
+                        "❌ Ошибка при отправке файла!\n"
+                        "Текст извлечен успешно, но не удалось отправить результат."
+                    )
+                
+                self.converter.cleanup_temp_files(str(output_path))
+            else:
+                await query.edit_message_text("❌ Не удалось извлечь текст из файла!")
+                
+        except asyncio.TimeoutError:
+            await query.edit_message_text(
+                "⏰ <b>Превышено время обработки!</b>\n\n"
+                "Файл слишком большой или сложный для обработки.\n"
+                "Попробуйте отправить файл меньшего размера."
+            )
+            logger.error(f"Таймаут извлечения текста для файла {file_info['file_name']}")
+        except Exception as e:
+            await query.edit_message_text("❌ Не удалось извлечь текст из файла!")
+            logger.error(f"Ошибка извлечения текста: {e}")
     
     async def _extract_text_only(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                 pdf_path: Path, file_info: dict):
@@ -314,31 +561,70 @@ class PDFBot:
             with open(output_path, 'w', encoding='utf-8') as txt_file:
                 txt_file.write(text)
             
-            # Отправляем результат
-            with open(output_path, 'rb') as txt_file:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=txt_file,
-                    filename=output_name,
-                    caption=f"✅ <b>Текст извлечен!</b>\n"
-                           f"📝 {file_info['file_name']} → {output_name}",
-                    parse_mode=ParseMode.HTML
+            # Отправляем результат с таймаутом
+            send_success = await self._send_file_with_timeout(
+                context.bot,
+                query.message.chat_id,
+                output_path,
+                output_name,
+                f"✅ <b>Текст извлечен!</b>\n"
+                f"📝 {file_info['file_name']} → {output_name}"
+            )
+            
+            if send_success:
+                await query.edit_message_text("✅ Текст успешно извлечен!")
+            else:
+                await query.edit_message_text(
+                    "❌ Ошибка при отправке файла!\n"
+                    "Текст извлечен успешно, но не удалось отправить результат."
                 )
             
-            await query.edit_message_text("✅ Текст успешно извлечен!")
             self.converter.cleanup_temp_files(str(output_path))
         else:
             await query.edit_message_text("❌ Не удалось извлечь текст из файла!")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
-        logger.error(f"Ошибка: {context.error}")
+        error = context.error
+        logger.error(f"Ошибка: {error}")
+        
+        # Определяем тип ошибки и отправляем соответствующее сообщение
+        error_message = "❌ Произошла неожиданная ошибка!\n"
+        
+        if isinstance(error, (TimedOut, asyncio.TimeoutError)):
+            error_message = (
+                "⏰ <b>Ошибка таймаута!</b>\n\n"
+                "Операция заняла слишком много времени.\n"
+                "Возможные причины:\n"
+                "• Файл слишком большой\n"
+                "• Медленное интернет-соединение\n"
+                "• Высокая нагрузка на сервер\n\n"
+                "Попробуйте:\n"
+                "• Отправить файл меньшего размера\n"
+                "• Проверить интернет-соединение\n"
+                "• Попробовать еще раз через несколько минут"
+            )
+        elif isinstance(error, NetworkError):
+            error_message = (
+                "🌐 <b>Ошибка сети!</b>\n\n"
+                "Проблемы с интернет-соединением.\n"
+                "Проверьте подключение к интернету и попробуйте еще раз."
+            )
+        elif "Timed out" in str(error):
+            error_message = (
+                "⏰ <b>Превышено время ожидания!</b>\n\n"
+                "Операция не была завершена в установленное время.\n"
+                "Попробуйте отправить файл меньшего размера или повторить попытку."
+            )
         
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ Произошла неожиданная ошибка!\n"
-                "Попробуйте еще раз или обратитесь к администратору."
-            )
+            try:
+                await update.effective_message.reply_text(
+                    error_message,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при отправке сообщения об ошибке: {e}")
 
 def main():
     """Основная функция запуска бота"""
